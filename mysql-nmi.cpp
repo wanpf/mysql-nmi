@@ -1,9 +1,7 @@
-// clang-format off
-#include <condition_variable>
-#include <mutex>
+#include <pipy/nmi.h>
 #include <string>
 #include <thread>
-#include <pipy/nmi.h>
+#include <cstdlib>
 
 extern "C" {
 
@@ -19,6 +17,13 @@ int probe_mysql(char *ip, int port, char *user, char *passwd, char *sql) {
   if (con == NULL) {
     return -1;
   }
+
+  unsigned int mysql_ct = 3;
+
+  if (mysql_options(con, MYSQL_OPT_CONNECT_TIMEOUT, &mysql_ct)) {
+    fprintf(stderr, "debug (mysql): [mysql_options] failed.");
+  }
+
   if (mysql_real_connect(con, ip, user, passwd, NULL, port, NULL, 0) == NULL) {
     mysql_close(con);
     return -2;
@@ -46,60 +51,17 @@ int probe_mysql(char *ip, int port, char *user, char *passwd, char *sql) {
 }
 }
 
-class MysqlProbe {
-  std::mutex m;
-  std::condition_variable cv;
-  pipy_pipeline m_pipeline;
-  std::thread m_thread;
-  bool ready = false;
+//
+// MysqlProbePipeline
+//
 
-  void main() {
-    std::unique_lock<std::mutex> lk(m);
-    cv.wait(lk, [this] { return ready; });
-    auto ppl = m_pipeline;
-    rc = probe_mysql(ip, port, user, passwd, sql);
-    pipy_schedule(ppl, 0, output_end, this);
-  }
-
-  static void output_end(void *user_ptr) {
-    auto thiz = static_cast<MysqlProbe *>(user_ptr);
-    auto ppl = thiz->m_pipeline;
-
-    pjs_value response_head = pjs_object();
-    pjs_object_set_property(response_head, pjs_string("result", strlen("result")), pjs_number(thiz->rc));
-    pipy_output_event(ppl, pipy_MessageStart_new(response_head));
-    pipy_output_event(ppl, pipy_MessageEnd_new(0, 0));
-
-    pipy_free(ppl);
-  }
-
-public:
-  MysqlProbe(pipy_pipeline ppl) : m_pipeline(ppl), m_thread([this]() { main(); }) {
-    pipy_hold(m_pipeline);
-    m_thread.detach();
-  }
-
-  void launch() {
-    {
-      std::lock_guard<std::mutex> lk(m);
-      ready = true;
-    }
-    cv.notify_one();
-  }
-
-  int is_started;
-  int rc;
-  // user data
+struct config {
   int port;
   char ip[128];
   char user[128];
   char passwd[128];
   char sql[1024];
 };
-
-static void pipeline_init(pipy_pipeline ppl, void **user_ptr) { *user_ptr = new MysqlProbe(ppl); }
-
-static void pipeline_free(pipy_pipeline ppl, void *user_ptr) { delete static_cast<MysqlProbe *>(user_ptr); }
 
 static char *get_string(pjs_value head, char *name, char *buf, int size) {
   pjs_value value = pjs_undefined();
@@ -127,24 +89,108 @@ static int get_int(pjs_value head, char *name, int *n) {
   return 0;
 }
 
-static void pipeline_process(pipy_pipeline ppl, void *user_ptr, pjs_value evt) {
-  MysqlProbe *state = (MysqlProbe *)user_ptr;
-  if (pipy_is_MessageStart(evt)) {
-    state->is_started = 1;
-    pjs_value head = pipy_MessageStart_get_head(evt);
-    if (!pjs_is_null(head)) {
-      get_string(head, "mysqlIp", state->ip, sizeof(state->ip));
-      get_int(head, "mysqlPort", &state->port);
-      get_string(head, "mysqlUser", state->user, sizeof(state->user));
-      get_string(head, "mysqlPasswd", state->passwd, sizeof(state->passwd));
-      get_string(head, "mysqlSql", state->sql, sizeof(state->sql));
-    }
-  } else if (pipy_is_MessageEnd(evt)) {
-    if (state->is_started == 1) {
-      state->launch();
+class MysqlProbePipeline {
+public:
+  MysqlProbePipeline(pipy_pipeline pipeline) : m_pipeline(pipeline) {}
+
+  void process(pjs_value evt) {
+    if (pipy_is_MessageStart(evt)) {
+      if (!m_message_started) {
+        m_message_started = true;
+        {
+          pjs_value head = pipy_MessageStart_get_head(evt);
+          if (!pjs_is_null(head)) {
+            get_string(head, "mysqlIp", cfg.ip, sizeof(cfg.ip));
+            get_int(head, "mysqlPort", &cfg.port);
+            get_string(head, "mysqlUser", cfg.user, sizeof(cfg.user));
+            get_string(head, "mysqlPasswd", cfg.passwd, sizeof(cfg.passwd));
+            get_string(head, "mysqlSql", cfg.sql, sizeof(cfg.sql));
+          }
+        }
+        m_message_body.clear();
+      }
+    } else if (pipy_is_Data(evt)) {
+      if (m_message_started) {
+        auto len = pipy_Data_get_size(evt);
+        auto buf = new char[len];
+        pipy_Data_get_data(evt, buf, len);
+        m_message_body.append(buf, len);
+        delete [] buf;
+      }
+    } else if (pipy_is_MessageEnd(evt)) {
+      if (m_message_started) {
+        new MysqlProbe(m_pipeline, cfg, m_message_body);
+        m_message_started = false;
+      }
     }
   }
+
+private:
+  pipy_pipeline m_pipeline;
+  std::string m_message_body;
+  bool m_message_started = false;
+  config cfg;
+
+  //
+  // MysqlProbePipeline::MysqlProbe
+  //
+
+  class MysqlProbe {
+  public:
+    MysqlProbe(pipy_pipeline pipeline, const config &cfg, const std::string &host)
+      : m_pipeline(pipeline)
+      , m_cfg(cfg)
+      , m_host(host)
+    {
+      pipy_hold(pipeline);
+      std::thread(
+        [this]() {
+          rc = probe_mysql(m_cfg.ip, m_cfg.port, m_cfg.user, m_cfg.passwd, m_cfg.sql);
+          pipy_schedule(m_pipeline, 0, output, this);
+        }
+      ).detach();
+    }
+
+  private:
+    pipy_pipeline m_pipeline;
+    config m_cfg;
+    std::string m_host;
+    int m_result;
+    int rc;
+
+    static void output(void *user_ptr) {
+      static_cast<MysqlProbe*>(user_ptr)->output();
+    }
+
+    void output() {
+      pjs_value response_head = pjs_object();
+      pjs_object_set_property(response_head, pjs_string("result", strlen("result")), pjs_number(rc));
+      pipy_output_event(m_pipeline, pipy_MessageStart_new(response_head));
+      pipy_output_event(m_pipeline, pipy_MessageEnd_new(0, 0));
+      pipy_free(m_pipeline);
+      delete this;
+    }
+  };
+};
+
+static void pipeline_init(pipy_pipeline ppl, void **user_ptr) {
+  *user_ptr = new MysqlProbePipeline(ppl);
 }
 
-extern "C" void pipy_module_init() { pipy_define_pipeline("", pipeline_init, pipeline_free, pipeline_process); }
+static void pipeline_free(pipy_pipeline ppl, void *user_ptr) {
+  delete static_cast<MysqlProbePipeline*>(user_ptr);
+}
+
+static void pipeline_process(pipy_pipeline ppl, void *user_ptr, pjs_value evt) {
+  static_cast<MysqlProbePipeline*>(user_ptr)->process(evt);
+}
+
+extern "C" void pipy_module_init() {
+  pipy_define_pipeline(
+    "",
+    pipeline_init,
+    pipeline_free,
+    pipeline_process
+  );
+}
 

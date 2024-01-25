@@ -6,7 +6,7 @@ pipy()
   .onStart(
     () => (
       new Message({
-        mysqlIp: '127.0.0.1',
+        mysqlIp: '129.0.0.1',
         mysqlPort: 3305,
         mysqlUser: 'root',
         mysqlPasswd: '123456',
@@ -30,7 +30,7 @@ pipy()
   .onStart(
     () => (
       new Message({
-        mysqlIp: '127.0.0.1',
+        mysqlIp: '192.168.122.188',
         mysqlPort: 3306,
         mysqlUser: 'root',
         mysqlPasswd: '123456',

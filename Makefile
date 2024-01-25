@@ -18,7 +18,7 @@ endif
 all: ${PRODUCT}
 
 ${PRODUCT}: ${ROOT_DIR}/mysql-nmi.cpp
-	clang++ ${CXXFLAGS} -I${INC_DIR} -I/usr/include/mysql ${LDFLAGS} -shared $< -o $@
+	clang++ ${CXXFLAGS} -I${INC_DIR} -I/root/mysql/mysql-8.0.33-linux-glibc2.17-x86_64-minimal/include/ -I/usr/include/mysql ${LDFLAGS} -shared $< -o $@
 
 clean:
 	rm -f ${PRODUCT}
